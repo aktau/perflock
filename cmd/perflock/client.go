@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"os"
 )
 
 type Client struct {
@@ -31,21 +32,23 @@ func NewClient(socketPath string) *Client {
 }
 
 func (c *Client) do(action PerfLockAction, response interface{}) {
+	vlog("-> (%T) %+v\n", action.Action, action.Action)
 	err := c.gr.Encode(action)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	err = c.gw.Decode(response)
+	vlog("<- (%T) %+v\n", response, response)
 	if err != nil {
 		log.Fatal(err)
 	}
 }
 
-func (c *Client) Acquire(shared, nonblocking bool, msg string) bool {
-	var ok bool
-	c.do(PerfLockAction{ActionAcquire{Shared: shared, NonBlocking: nonblocking, Msg: msg}}, &ok)
-	return ok
+func (c *Client) Acquire(shared, nonblocking bool, cores uint, msg string) *ActionAcquireResponse {
+	var resp ActionAcquireResponse
+	c.do(PerfLockAction{ActionAcquire{Pid: os.Getpid(), Shared: shared, Cores: cores, NonBlocking: nonblocking, Msg: msg}}, &resp)
+	return &resp
 }
 
 func (c *Client) List() []string {

@@ -16,12 +16,36 @@ import (
 	"time"
 
 	"github.com/aclements/perflock/internal/cpupower"
+	"github.com/aclements/perflock/internal/cpuset"
+	"golang.org/x/sys/unix"
 	"inet.af/peercred"
 )
 
 var theLock PerfLock
 
+var allCores unix.CPUSet
+
 func doDaemon(path string) {
+	// TODO(aktau): Don't just assume that pid 0's cpuset is the full system
+	// cpuset. Perhaps it's allowed mask would be that, though...
+	var err error
+	allCores, err = cpuset.CPUSetOfPid(1)
+	if err != nil {
+		panic(err)
+	}
+	// TODO(aktau): How to deal with changing (system-level) CPU masks?
+	//
+	// An admin could (e.g.) disable hyperthreading at runtime this way:
+	//
+	//  $ echo off | sudo tee /sys/devices/system/cpu/smt/control
+	//
+	// For now we punt on this issue, and hope they restart the daemon after doing
+	// this. We could poll whether allCores still matches the definition we have,
+	// and if so (a) no longer accept new tasks and (b) exit as soon as all
+	// current tasks are done. If we're running via a process manager (like
+	// systemd), it will restart us.
+	theLock.cores = allCores
+
 	// TODO: Don't start if another daemon is already running.
 
 	// Linux supports an abstract namespace for UNIX domain sockets (see unix(7)).
@@ -66,6 +90,15 @@ type Server struct {
 	oldGovernors []*governorSettings
 }
 
+func send(enc *gob.Encoder, a interface{}) bool {
+	if err := enc.Encode(a); err != nil {
+		log.Printf("could not send response %T %v to user: %v", a, a, err)
+		return false
+	}
+	vlog("-> %T %+v\n", a, a)
+	return true
+}
+
 func NewServer(c net.Conn) *Server {
 	return &Server{c: c}
 }
@@ -103,6 +136,7 @@ func (s *Server) Serve() {
 				close(actions)
 				return
 			}
+			vlog("<- %T%+v\n", msg.Action, msg.Action)
 			actions <- msg
 		}
 	}()
@@ -127,27 +161,36 @@ func (s *Server) Serve() {
 					log.Printf("protocol error: acquiring lock twice")
 					return
 				}
-				msg := fmt.Sprintf("%s\t%s\t%s", s.userName, time.Now().Format(time.Stamp), action.Msg)
+				msg := fmt.Sprintf("%s\t%s\t%s\tcores=%d", s.userName, time.Now().Format(time.Stamp), action.Msg, action.Cores)
 				if action.Shared {
 					msg += " [shared]"
 				}
-				s.locker = theLock.Enqueue(action.Shared, action.NonBlocking, msg)
+				availCores, err := cpuset.CPUSetOfPid(action.Pid)
+				if err != nil {
+					log.Printf("cannot determine CPU set of pid %d: %v", action.Pid, err)
+					return
+				}
+				if action.Cores > uint(availCores.Count()) {
+					send(gw, ActionAcquireResponse{
+						Err: fmt.Errorf("requested %d cores, but process only has %d available (system has %d)", action.Cores, availCores.Count(), allCores.Count()).Error(),
+					})
+					return
+				}
+				s.locker = theLock.Enqueue(action.Shared, action.NonBlocking, action.Cores, availCores, msg)
 				if s.locker != nil {
 					// Enqueued. Wait for acquire.
 					s.acquiring = true
 					acquireC = s.locker.C
 				} else {
 					// Non-blocking acquire failed.
-					if err := gw.Encode(false); err != nil {
-						log.Print(err)
+					if !send(gw, ActionAcquireResponse{}) {
 						return
 					}
 				}
 
 			case ActionList:
 				list := theLock.Queue()
-				if err := gw.Encode(list); err != nil {
-					log.Print(err)
+				if !send(gw, list) {
 					return
 				}
 
@@ -161,8 +204,7 @@ func (s *Server) Serve() {
 				if err != nil {
 					errString = err.Error()
 				}
-				if err := gw.Encode(errString); err != nil {
-					log.Print(err)
+				if !send(gw, errString) {
 					return
 				}
 
@@ -174,8 +216,7 @@ func (s *Server) Serve() {
 		case <-acquireC:
 			// Lock acquired.
 			s.acquiring, acquireC = false, nil
-			if err := gw.Encode(true); err != nil {
-				log.Print(err)
+			if !send(gw, ActionAcquireResponse{Acquired: true, Cores: s.locker.assignedCores}) {
 				return
 			}
 		}

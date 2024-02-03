@@ -4,7 +4,11 @@
 
 package main
 
-import "encoding/gob"
+import (
+	"encoding/gob"
+
+	"golang.org/x/sys/unix"
+)
 
 type PerfLockAction struct {
 	Action interface{}
@@ -14,9 +18,20 @@ type PerfLockAction struct {
 // indicating whether or not the lock was acquired (which may be false
 // for a non-blocking acquire).
 type ActionAcquire struct {
+	Pid   int  // The pid of the requester, used to see what sorts of permissions it has (CPU set...).
+	Cores uint // 0 for "no limit"
+
 	Shared      bool
 	NonBlocking bool
 	Msg         string
+}
+
+type ActionAcquireResponse struct {
+	Acquired bool // If true, the other fields can be read.
+
+	Cores unix.CPUSet // The cores on which to limit oneself.
+
+	Err string
 }
 
 // ActionList returns the list of current and pending lock

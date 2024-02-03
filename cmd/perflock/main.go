@@ -7,7 +7,7 @@
 //
 // The typical use of perflock is:
 //
-//     perflock [-shared] command...
+//	perflock [-shared] command...
 //
 // This will acquire a system-wide lock while running command.
 //
@@ -24,8 +24,8 @@
 // For convenience, we recommend you create shell aliases for
 // perflock:
 //
-//     alias pl=perflock
-//     alias pls='perflock -shared'
+//	alias pl=perflock
+//	alias pls='perflock -shared'
 //
 // perflock depends on a locking daemon, which can be started with
 // perflock -daemon.
@@ -38,9 +38,18 @@ import (
 	"os"
 	"os/exec"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
+
+	"github.com/aclements/perflock/internal/cpuset"
+	"golang.org/x/sys/unix"
+)
+
+var (
+	gVerbose  = false
+	gIsClient = true
 )
 
 func main() {
@@ -57,11 +66,15 @@ func main() {
 	flagList := flag.Bool("list", false, "print current and pending commands")
 	flagSocket := flag.String("socket", "/var/run/perflock.socket", "connect to socket `path`")
 	flagShared := flag.Bool("shared", false, "acquire lock in shared mode (default: exclusive mode)")
+	flagVerbose := flag.Bool("verbose", false, "be verbose, useful for debuggging")
+	flagCores := flag.Uint("cores", 0, "how many cores to reserve")
 	flagGovernor := &governorFlag{percent: 90}
 	flag.Var(flagGovernor, "governor", "set CPU frequency to `percent` between the min and max\n\twhile running command, or \"none\" for no adjustment")
 	flag.Parse()
+	gVerbose = *flagVerbose
 
 	if *flagDaemon {
+		gIsClient = false
 		if flag.NArg() > 0 {
 			flag.Usage()
 			os.Exit(2)
@@ -91,19 +104,51 @@ func main() {
 		os.Exit(2)
 	}
 	c := NewClient(*flagSocket)
-	if !c.Acquire(*flagShared, true, shellEscapeList(cmd)) {
+	resp := c.Acquire(*flagShared, true, *flagCores, shellEscapeList(cmd))
+	if resp.Err != "" {
+		fmt.Fprintf(os.Stderr, "invalid request: %v\n", resp.Err)
+		return
+	}
+	if !resp.Acquired {
 		list := c.List()
 		fmt.Fprintf(os.Stderr, "Waiting for lock...\n")
 		for _, l := range list {
 			fmt.Fprintln(os.Stderr, l)
 		}
-		c.Acquire(*flagShared, false, shellEscapeList(cmd))
+		resp = c.Acquire(*flagShared, false, *flagCores, shellEscapeList(cmd))
 	}
-	if !*flagShared && flagGovernor.percent >= 0 {
-		c.SetGovernor(flagGovernor.percent)
+	if !*flagShared {
+		if flagGovernor.percent >= 0 {
+			c.SetGovernor(flagGovernor.percent)
+		}
+	}
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+	if *flagCores > 0 {
+		// TODO(aktau): Verify that we actually have the cores we want. It's
+		//              possible to get a smaller set than the one desired:
+		//              https://unix.stackexchange.com/a/732654.
+		fmt.Printf("setting affinity to %s", cpuset.String(resp.Cores))
+		err := unix.SchedSetaffinity(0, &resp.Cores)
+		if err != nil {
+			fmt.Printf("SchedSetaffinity: %v", err)
+		}
 	}
 	ignoreSignals()
 	run(cmd)
+}
+
+// vlog logs if gVerbose is true.
+func vlog(format string, a ...interface{}) {
+	if gVerbose {
+		logfn := log.Printf
+		if gIsClient {
+			logfn = func(format string, a ...interface{}) {
+				fmt.Fprintf(os.Stderr, format, a...)
+			}
+		}
+		logfn(format, a...)
+	}
 }
 
 type governorFlag struct {
